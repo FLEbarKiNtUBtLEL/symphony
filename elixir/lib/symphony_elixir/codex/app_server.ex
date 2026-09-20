@@ -556,10 +556,23 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata
           )
 
-          Logger.debug("Codex notification: #{inspect(method)}")
+          log_notification(method, payload)
           receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
         end
     end
+  end
+
+  # An "error" notification carries the reason a turn failed. Logging only the
+  # method name discards it, leaving an operator with a run that completed in
+  # seconds and no way to find out why -- the payload is the one thing they
+  # need. Other notifications stay at debug; this is not a general verbosity
+  # increase.
+  defp log_notification("error", payload) do
+    Logger.warning("Codex error notification: #{inspect(payload)}")
+  end
+
+  defp log_notification(method, _payload) do
+    Logger.debug("Codex notification: #{inspect(method)}")
   end
 
   defp maybe_handle_approval_request(
