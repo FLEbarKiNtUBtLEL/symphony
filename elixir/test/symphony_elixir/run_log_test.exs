@@ -7,6 +7,7 @@ defmodule SymphonyElixir.RunLogTest do
     dir = Path.join(System.tmp_dir!(), "symphony-run-log-#{System.unique_integer([:positive])}")
     file = Path.join(dir, "runs.jsonl")
     previous = Application.get_env(:symphony_elixir, :run_log_file)
+    previous_log = Application.get_env(:symphony_elixir, :log_file)
     Application.put_env(:symphony_elixir, :run_log_file, file)
 
     on_exit(fn ->
@@ -14,6 +15,12 @@ defmodule SymphonyElixir.RunLogTest do
         Application.put_env(:symphony_elixir, :run_log_file, previous)
       else
         Application.delete_env(:symphony_elixir, :run_log_file)
+      end
+
+      if previous_log do
+        Application.put_env(:symphony_elixir, :log_file, previous_log)
+      else
+        Application.delete_env(:symphony_elixir, :log_file)
       end
 
       File.rm_rf(dir)
@@ -24,8 +31,26 @@ defmodule SymphonyElixir.RunLogTest do
 
   defp issue, do: %{id: 61, identifier: "GH-61"}
 
-  test "default_path/1 builds the run log path under a custom root" do
-    assert RunLog.default_path("/tmp/symphony") == "/tmp/symphony/log/symphony-runs.jsonl"
+  test "default_path/1 puts the run log beside the given log file" do
+    assert RunLog.default_path("/tmp/symphony/log/symphony.log") ==
+             "/tmp/symphony/log/symphony-runs.jsonl"
+  end
+
+  test "path/0 follows a relocated application log" do
+    # The bug this replaces: deriving from File.cwd!() meant Symphony started
+    # from another directory wrote its run log where nobody looks. The file
+    # exists and stays empty, so missing records read as missing runs.
+    Application.delete_env(:symphony_elixir, :run_log_file)
+    Application.put_env(:symphony_elixir, :log_file, "/var/log/symphony/symphony.log")
+
+    assert RunLog.path() == "/var/log/symphony/symphony-runs.jsonl"
+  end
+
+  test "an explicit :run_log_file still wins outright" do
+    Application.put_env(:symphony_elixir, :log_file, "/var/log/symphony/symphony.log")
+    Application.put_env(:symphony_elixir, :run_log_file, "/elsewhere/runs.jsonl")
+
+    assert RunLog.path() == "/elsewhere/runs.jsonl"
   end
 
   test "measure/3 returns the wrapped value and records a successful run" do

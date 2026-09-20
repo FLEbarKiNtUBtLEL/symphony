@@ -27,16 +27,46 @@ defmodule SymphonyElixir.RunLog do
 
   require Logger
 
-  @default_relative_path "log/symphony-runs.jsonl"
+  alias SymphonyElixir.LogFile
 
+  @filename "symphony-runs.jsonl"
+
+  @doc """
+  Default location: beside the configured application log.
+
+  The first version derived this from `File.cwd!()`, which is wrong in a way
+  that fails quietly: Symphony started from a different directory writes its
+  run log somewhere nobody looks, and an observability sink that writes to the
+  wrong place is worse than one that does not write at all -- the file exists,
+  it is just empty, so the absence of records reads as an absence of runs.
+
+  Following `LogFile` keeps the two together wherever the operator has put
+  them, and makes `:log_file` the single setting that moves both.
+  """
   @spec default_path() :: Path.t()
-  def default_path, do: default_path(File.cwd!())
+  def default_path, do: Path.join(Path.dirname(LogFile.default_log_file()), @filename)
 
   @spec default_path(Path.t()) :: Path.t()
-  def default_path(root) when is_binary(root), do: Path.join(root, @default_relative_path)
+  def default_path(log_file) when is_binary(log_file),
+    do: Path.join(Path.dirname(log_file), @filename)
 
+  @doc """
+  Where the run log is written.
+
+  `:run_log_file` overrides it outright; otherwise it follows `:log_file`, so
+  an operator who relocates the application log relocates this with it rather
+  than discovering later that the two diverged.
+  """
   @spec path() :: Path.t()
-  def path, do: Application.get_env(:symphony_elixir, :run_log_file, default_path())
+  def path do
+    case Application.get_env(:symphony_elixir, :run_log_file) do
+      nil ->
+        default_path(Application.get_env(:symphony_elixir, :log_file, LogFile.default_log_file()))
+
+      configured ->
+        configured
+    end
+  end
 
   @doc """
   Time `fun`, then append a record describing how it ended.
