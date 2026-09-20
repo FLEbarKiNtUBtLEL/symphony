@@ -4,6 +4,7 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
+  alias SymphonyElixir.RunLog
   alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.{Config, PromptBuilder, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
@@ -25,6 +26,15 @@ defmodule SymphonyElixir.AgentRunner do
 
     Logger.info("Starting agent run for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}")
 
+    # One structured line per run, so "how often did this dispatch and how did
+    # each end" is a query rather than a reconstruction. Returns and re-raises
+    # exactly what the wrapped call does.
+    RunLog.measure(issue, [worker_host: worker_host], fn ->
+      run_and_report(issue, codex_update_recipient, opts, worker_host)
+    end)
+  end
+
+  defp run_and_report(issue, codex_update_recipient, opts, worker_host) do
     case run_on_worker_host(issue, codex_update_recipient, opts, worker_host) do
       :ok ->
         :ok

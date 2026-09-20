@@ -6,6 +6,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.RunLog
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -22,6 +23,18 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, :issue_not_found} ->
         error_response(conn, 404, "issue_not_found", "Issue not found")
     end
+  end
+
+  @spec runs(Conn.t(), map()) :: Conn.t()
+  def runs(conn, params) do
+    limit =
+      case Integer.parse(Map.get(params, "limit", "100")) do
+        {n, ""} when n > 0 and n <= 1000 -> n
+        _ -> 100
+      end
+
+    entries = RunLog.recent(limit, issue_identifier: Map.get(params, "issue"))
+    json(conn, %{runs: entries, count: length(entries)})
   end
 
   @spec refresh(Conn.t(), map()) :: Conn.t()

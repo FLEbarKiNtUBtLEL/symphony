@@ -314,7 +314,10 @@ defmodule SymphonyElixir.ExtensionsTest do
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
+             "rate_limits" => %{"primary" => %{"remaining" => 11}},
+             # Populated only when the live value is absent, so the two can
+             # never disagree. Here a live value is present, so it is nil.
+             "rate_limits_last_seen" => nil
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")

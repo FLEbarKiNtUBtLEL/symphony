@@ -7,6 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
+  alias SymphonyElixir.RunLog
+
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
@@ -1660,6 +1662,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp apply_codex_rate_limits(%State{} = state, update) when is_map(update) do
     case extract_rate_limits(update) do
       %{} = rate_limits ->
+        # Persist only on change: Codex reports these on most turns, and an
+        # unchanged value repeated every few seconds is noise, not history.
+        if rate_limits != state.codex_rate_limits do
+          RunLog.record_rate_limits(rate_limits)
+        end
+
         %{state | codex_rate_limits: rate_limits}
 
       _ ->

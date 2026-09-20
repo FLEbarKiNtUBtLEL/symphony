@@ -22,7 +22,8 @@ defmodule SymphonyElixirWeb.Presenter do
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          rate_limits_last_seen: rate_limits_last_seen(snapshot.rate_limits)
         }
 
       :timeout ->
@@ -239,4 +240,23 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp iso8601(_datetime), do: nil
+  # `rate_limits` keeps its exact prior meaning: the live value, nil when
+  # unknown. Changing its shape would break every existing consumer, and a
+  # consumer that kept reading it would silently receive a stale value -- the
+  # hazard this is meant to remove.
+  #
+  # The history is additive instead. It is only populated when the live value
+  # is absent, so the two can never disagree, and it always carries
+  # observed_at: a persisted observation presented without its age is worse
+  # than none, because the reader cannot tell a current limit from one recorded
+  # before a restart hours ago.
+  defp rate_limits_last_seen(nil) do
+    case SymphonyElixir.RunLog.latest_rate_limits() do
+      {limits, observed_at} -> %{observed_at: observed_at, limits: limits}
+      nil -> nil
+    end
+  end
+
+  defp rate_limits_last_seen(_live), do: nil
+
 end
