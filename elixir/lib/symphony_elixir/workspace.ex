@@ -394,6 +394,56 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
+  # The issue a hook is running for, as environment.
+  #
+  # `issue_context` was already in scope at both call sites below and used only
+  # to build a log line, so a hook could be told which issue it was for in the
+  # log and not in the shell. That is the difference between a hook that reports
+  # and a hook that can decide: a `before_run` that returns non-zero already
+  # stops the Codex turn (agent_runner.ex), but nothing it could run knew which
+  # issue to judge.
+  #
+  # `SYMPHONY_ISSUE_IDENTIFIER` IS ALWAYS SET AND NEVER EMPTY -- `issue_context/1`
+  # defaults it to "issue" -- so a hook can test it to tell "this Symphony does
+  # not set these" from "this issue has no id". That distinction has to live on
+  # the identifier because it cannot live on the id: at this layer an empty
+  # value IS an unset variable. Measured rather than assumed:
+  #
+  #   System.cmd("sh", ["-lc", ~s(printf %s "${X-UNSET}")], env: [{"X", ""}])
+  #   #=> {"UNSET", 0}
+  #
+  # So `SYMPHONY_ISSUE_ID` is set only when the tracker supplied one. An earlier
+  # draft of this comment claimed both were always set, with the id empty when
+  # absent; that was wrong about the platform, and a hook written against it
+  # would have read "no id" as "old build" and fallen open.
+  defp hook_env(%{issue_id: issue_id, issue_identifier: identifier}) do
+    [{"SYMPHONY_ISSUE_IDENTIFIER", to_string(identifier || "issue")}] ++
+      case issue_id do
+        nil -> []
+        id -> [{"SYMPHONY_ISSUE_ID", to_string(id)}]
+      end
+  end
+
+  # The remote path sends a shell STRING over ssh and so cannot take an env
+  # list. Public only so it can be tested: running it for real needs an SSH
+  # worker host, which puts it among the `:live_e2e` tests that do not run here,
+  # and the escaping is the part worth covering -- an identifier is
+  # tracker-controlled text, so interpolating it raw into a command line would
+  # let a crafted issue run something.
+  @doc false
+  @spec remote_hook_script(Path.t(), String.t(), map()) :: String.t()
+  def remote_hook_script(workspace, command, issue_context) do
+    exports =
+      issue_context
+      |> hook_env()
+      |> Enum.map_join(" ", fn {k, v} -> "#{k}=#{shell_escape(v)}" end)
+
+    case exports do
+      "" -> "cd #{shell_escape(workspace)} && #{command}"
+      _ -> "cd #{shell_escape(workspace)} && export #{exports} && #{command}"
+    end
+  end
+
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
@@ -401,7 +451,11 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        System.cmd("sh", ["-lc", command],
+          cd: workspace,
+          env: hook_env(issue_context),
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -422,7 +476,9 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    script = remote_hook_script(workspace, command, issue_context)
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
