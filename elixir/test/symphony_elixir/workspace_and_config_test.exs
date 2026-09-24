@@ -280,6 +280,156 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "hooks are told which issue they are running for" do
+    # `issue_context` was already in scope where hooks are spawned and used only
+    # to build a log line, so a hook could learn the issue from the log and not
+    # from the shell. That is the difference between a hook that reports and one
+    # that can decide: a non-zero `before_run` already stops the Codex turn, but
+    # nothing it could run knew which issue to judge.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-issue-env-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    seen = Path.join(test_root, "seen")
+
+    try do
+      File.mkdir_p!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "printf '%s|%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" \"$SYMPHONY_ISSUE_ID\" > \"#{seen}\""
+      )
+
+      assert {:ok, _workspace} = Workspace.create_for_issue(%{id: "id-7", identifier: "GH-7"})
+      assert File.read!(seen) == "GH-7|id-7"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a hook with no tracker issue id gets the identifier, and no id variable" do
+    # The identifier is the build marker, because the id cannot be: at this
+    # layer an empty env value IS an unset variable --
+    #   System.cmd("sh", ["-lc", ~s(printf %s "${X-UNSET}")], env: [{"X", ""}])
+    #   #=> {"UNSET", 0}
+    # -- so a hook distinguishes "this Symphony does not set these" from "this
+    # issue has no id" by testing SYMPHONY_ISSUE_IDENTIFIER, which is never
+    # absent and never empty.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-issue-env-empty-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    seen = Path.join(test_root, "seen")
+
+    try do
+      File.mkdir_p!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create:
+          "printf '%s|%s|%s' \"${SYMPHONY_ISSUE_IDENTIFIER-unset}\" \"${SYMPHONY_ISSUE_ID-unset}\" \"$SYMPHONY_ISSUE_ID\" > \"#{seen}\""
+      )
+
+      assert {:ok, _workspace} = Workspace.create_for_issue("S-9")
+      assert File.read!(seen) == "S-9|unset|"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "a before_run hook can refuse the issue it is given, and the turn does not run" do
+    # The gate this change exists to make reachable: the hook sees the issue,
+    # decides, and a non-zero exit stops the run.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-before-run-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+
+    try do
+      File.mkdir_p!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_before_run: ~S(test "$SYMPHONY_ISSUE_IDENTIFIER" != "GH-BAD" || exit 9)
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue(%{id: "1", identifier: "GH-BAD"})
+
+      assert {:error, {:workspace_hook_failed, "before_run", 9, _output}} =
+               Workspace.run_before_run_hook(workspace, %{id: "1", identifier: "GH-BAD"})
+
+      assert {:ok, ok_workspace} = Workspace.create_for_issue(%{id: "2", identifier: "GH-OK"})
+      assert :ok = Workspace.run_before_run_hook(ok_workspace, %{id: "2", identifier: "GH-OK"})
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "an identifier with shell metacharacters is not executed by a hook" do
+    # Identifiers are tracker-controlled text. Interpolating one into a command
+    # line would let a crafted issue run something; both paths escape.
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-issue-env-escape-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = Path.join(test_root, "workspaces")
+    seen = Path.join(test_root, "seen")
+    should_not_exist = Path.join(test_root, "pwned")
+
+    try do
+      File.mkdir_p!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "printf '%s' \"$SYMPHONY_ISSUE_IDENTIFIER\" > \"#{seen}\""
+      )
+
+      nasty = "GH-1'; touch #{should_not_exist}; echo '"
+      assert {:ok, _workspace} = Workspace.create_for_issue(%{id: "x", identifier: nasty})
+      assert File.read!(seen) == nasty
+      refute File.exists?(should_not_exist)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "the remote hook script exports the issue, escaped" do
+    # The remote path cannot take an env list, so the values go into a shell
+    # string. Running it needs an SSH worker host -- a `:live_e2e` test that
+    # does not run here -- but the escaping is what matters and is pure.
+    script =
+      Workspace.remote_hook_script("/ws", "do-thing", %{
+        issue_id: "id-1",
+        issue_identifier: "GH-1"
+      })
+
+    assert script ==
+             "cd '/ws' && export SYMPHONY_ISSUE_IDENTIFIER='GH-1' SYMPHONY_ISSUE_ID='id-1' && do-thing"
+
+    # A single quote in tracker text must not close the quoting and start a
+    # command. `'\''` is the only way out of single quotes in sh.
+    nasty = Workspace.remote_hook_script("/ws", "do-thing", %{
+      issue_id: nil,
+      issue_identifier: "GH-1'; touch /tmp/pwned; echo '"
+    })
+
+    assert nasty ==
+             "cd '/ws' && export SYMPHONY_ISSUE_IDENTIFIER='GH-1'\"'\"'; touch /tmp/pwned; echo '\"'\"'' && do-thing"
+
+    refute String.contains?(nasty, "SYMPHONY_ISSUE_ID=")
+  end
+
   test "workspace surfaces after_create hook failures" do
     workspace_root =
       Path.join(
