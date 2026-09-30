@@ -334,14 +334,20 @@ defmodule SymphonyElixir.Config.Schema do
   @spec resolve_runtime_turn_sandbox_policy(%__MODULE__{}, Path.t() | nil, keyword()) ::
           {:ok, map()} | {:error, term()}
   def resolve_runtime_turn_sandbox_policy(settings, workspace \\ nil, opts \\ []) do
-    case settings.codex.turn_sandbox_policy do
-      %{} = policy ->
-        {:ok, ensure_workspace_write_root(policy, workspace, opts)}
+    result =
+      case settings.codex.turn_sandbox_policy do
+        %{} = policy ->
+          {:ok, ensure_workspace_write_root(policy, workspace, opts)}
 
-      _ ->
-        workspace
-        |> default_workspace_root(settings.workspace.root)
-        |> default_runtime_turn_sandbox_policy(opts)
+        _ ->
+          workspace
+          |> default_workspace_root(settings.workspace.root)
+          |> default_runtime_turn_sandbox_policy(opts)
+      end
+
+    case result do
+      {:ok, policy} -> {:ok, ensure_git_write_roots(policy, workspace, opts)}
+      other -> other
     end
   end
 
@@ -611,6 +617,71 @@ defmodule SymphonyElixir.Config.Schema do
   end
 
   defp ensure_workspace_write_root(policy, _workspace, _opts), do: policy
+
+  # Codex protects git metadata separately from the workspace tree. Granting only the
+  # workspace root leaves .git read-only, so a dispatched agent cannot take the index
+  # lock: `git commit` fails with "index.lock: Read-only file system" and no review or
+  # decision artifact can ever be written. Observed on BIO-CORE GH-193.
+  #
+  # Resolved by asking git rather than assuming <workspace>/.git. In a plain clone both
+  # answers are that path; in a WORKTREE they are separate external directories -- the
+  # per-worktree administrative dir and the shared common dir -- and a worktree needs
+  # both. Deduplicated, because the plain-clone case would otherwise list one twice.
+  #
+  # Deliberately NOT the parent repository or sibling workspaces: the point is that this
+  # workspace can write its own git metadata, not that an agent can reach another's.
+  defp ensure_git_write_roots(%{"type" => "workspaceWrite"} = policy, workspace, opts) do
+    case git_write_roots(workspace, opts) do
+      [] ->
+        policy
+
+      roots ->
+        writable_roots =
+          policy
+          |> Map.get("writableRoots", [])
+          |> normalize_writable_roots()
+          |> Kernel.++(roots)
+          |> Enum.uniq()
+
+        Map.put(policy, "writableRoots", writable_roots)
+    end
+  end
+
+  defp ensure_git_write_roots(policy, _workspace, _opts), do: policy
+
+  defp git_write_roots(workspace, opts) when is_binary(workspace) and workspace != "" do
+    # Remote workers do not share this filesystem, so local paths mean nothing there.
+    if Keyword.get(opts, :remote, false) do
+      []
+    else
+      ["--git-dir", "--git-common-dir"]
+      |> Enum.flat_map(&resolve_git_path(workspace, &1))
+      |> Enum.uniq()
+    end
+  end
+
+  defp git_write_roots(_workspace, _opts), do: []
+
+  defp resolve_git_path(workspace, flag) do
+    # A workspace that is not a repository yet, or a git that fails, yields nothing --
+    # never a guess. Granting a path git did not confirm would widen the sandbox on an
+    # assumption, which is worse than the lock failure it would paper over.
+    case System.cmd("git", ["-C", workspace, "rev-parse", "--path-format=absolute", flag],
+           stderr_to_stdout: true
+         ) do
+      {output, 0} ->
+        case String.trim(output) do
+          "" -> []
+          path -> [Path.expand(path)]
+        end
+
+      _ ->
+        []
+    end
+  rescue
+    # System.cmd raises if the workspace does not exist or git is absent.
+    _ -> []
+  end
 
   defp runtime_workspace_write_root(workspace, opts)
        when is_binary(workspace) and workspace != "" do

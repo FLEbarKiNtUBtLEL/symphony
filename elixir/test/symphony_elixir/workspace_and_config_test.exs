@@ -1886,4 +1886,80 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+  describe "git metadata writable roots" do
+    # Codex protects git metadata separately from the workspace tree, so granting only
+    # the workspace root leaves .git read-only and a dispatched agent cannot take the
+    # index lock: `git commit` fails with "index.lock: Read-only file system" and no
+    # review or decision artifact can ever be written. Observed on BIO-CORE GH-193.
+    setup do
+      base =
+        Path.join(System.tmp_dir!(), "symphony-git-roots-#{System.unique_integer([:positive])}")
+
+      clone = Path.join(base, "clone")
+      File.mkdir_p!(clone)
+      {_, 0} = System.cmd("git", ["init", "-q", clone])
+      {_, 0} = System.cmd("git", ["-C", clone, "config", "user.email", "a@b.c"])
+      {_, 0} = System.cmd("git", ["-C", clone, "config", "user.name", "t"])
+      File.write!(Path.join(clone, "f"), "x")
+      {_, 0} = System.cmd("git", ["-C", clone, "add", "f"])
+      {_, 0} = System.cmd("git", ["-C", clone, "commit", "-qm", "init"])
+
+      worktree = Path.join(base, "wt")
+      {_, 0} = System.cmd("git", ["-C", clone, "worktree", "add", "-q", worktree, "-b", "wt", "HEAD"])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: base,
+        codex_thread_sandbox: "workspace-write",
+        codex_turn_sandbox_policy: nil
+      )
+
+      on_exit(fn -> File.rm_rf(base) end)
+      %{base: base, clone: clone, worktree: worktree}
+    end
+
+    test "a plain clone lists its .git once, not twice", %{clone: clone} do
+      roots = Config.codex_turn_sandbox_policy(clone) |> Map.fetch!("writableRoots")
+      assert Path.expand(clone) in roots
+      assert Path.join(Path.expand(clone), ".git") in roots
+
+      assert roots == Enum.uniq(roots),
+             "--git-dir and --git-common-dir are the same path in a clone; it must be deduplicated"
+
+      assert length(roots) == 2
+    end
+
+    test "a worktree gets BOTH its administrative dir and the shared common dir",
+         %{clone: clone, worktree: worktree} do
+      roots = Config.codex_turn_sandbox_policy(worktree) |> Map.fetch!("writableRoots")
+      assert Path.expand(worktree) in roots
+
+      # The per-worktree dir: without it the index lock cannot be taken.
+      assert Path.join([Path.expand(clone), ".git", "worktrees", "wt"]) in roots
+
+      # The shared dir: without it refs and objects cannot be written.
+      assert Path.join(Path.expand(clone), ".git") in roots
+    end
+
+    test "the parent repository itself is not granted", %{base: base, worktree: worktree} do
+      roots = Config.codex_turn_sandbox_policy(worktree) |> Map.fetch!("writableRoots")
+
+      refute Path.expand(base) in roots,
+             "granting the parent would reach every sibling workspace"
+    end
+
+    test "a workspace that is not a repository grants nothing extra", %{base: base} do
+      plain = Path.join(base, "not-a-repo")
+      File.mkdir_p!(plain)
+      assert Config.codex_turn_sandbox_policy(plain) |> Map.fetch!("writableRoots") ==
+               [Path.expand(plain)]
+    end
+
+    test "a workspace that does not exist does not raise", %{base: base} do
+      absent = Path.join(base, "absent")
+
+      assert Config.codex_turn_sandbox_policy(absent) |> Map.fetch!("writableRoots") ==
+               [Path.expand(absent)]
+    end
+  end
+
 end
