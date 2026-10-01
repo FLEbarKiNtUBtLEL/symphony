@@ -332,8 +332,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create:
-          "printf '%s|%s|%s' \"${SYMPHONY_ISSUE_IDENTIFIER-unset}\" \"${SYMPHONY_ISSUE_ID-unset}\" \"$SYMPHONY_ISSUE_ID\" > \"#{seen}\""
+        hook_after_create: "printf '%s|%s|%s' \"${SYMPHONY_ISSUE_IDENTIFIER-unset}\" \"${SYMPHONY_ISSUE_ID-unset}\" \"$SYMPHONY_ISSUE_ID\" > \"#{seen}\""
       )
 
       assert {:ok, _workspace} = Workspace.create_for_issue("S-9")
@@ -419,10 +418,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     # A single quote in tracker text must not close the quoting and start a
     # command. `'\''` is the only way out of single quotes in sh.
-    nasty = Workspace.remote_hook_script("/ws", "do-thing", %{
-      issue_id: nil,
-      issue_identifier: "GH-1'; touch /tmp/pwned; echo '"
-    })
+    nasty =
+      Workspace.remote_hook_script("/ws", "do-thing", %{
+        issue_id: nil,
+        issue_identifier: "GH-1'; touch /tmp/pwned; echo '"
+      })
 
     assert nasty ==
              "cd '/ws' && export SYMPHONY_ISSUE_IDENTIFIER='GH-1'\"'\"'; touch /tmp/pwned; echo '\"'\"'' && do-thing"
@@ -1886,6 +1886,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       File.rm_rf(test_root)
     end
   end
+
   describe "git metadata writable roots" do
     # Codex protects git metadata separately from the workspace tree, so granting only
     # the workspace root leaves .git read-only and a dispatched agent cannot take the
@@ -1950,6 +1951,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     test "a workspace that is not a repository grants nothing extra", %{base: base} do
       plain = Path.join(base, "not-a-repo")
       File.mkdir_p!(plain)
+
       assert Config.codex_turn_sandbox_policy(plain) |> Map.fetch!("writableRoots") ==
                [Path.expand(plain)]
     end
@@ -1961,5 +1963,4 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                [Path.expand(absent)]
     end
   end
-
 end

@@ -666,9 +666,7 @@ defmodule SymphonyElixir.Config.Schema do
     # A workspace that is not a repository yet, or a git that fails, yields nothing --
     # never a guess. Granting a path git did not confirm would widen the sandbox on an
     # assumption, which is worse than the lock failure it would paper over.
-    case System.cmd("git", ["-C", workspace, "rev-parse", "--path-format=absolute", flag],
-           stderr_to_stdout: true
-         ) do
+    case System.cmd("git", ["-C", workspace, "rev-parse", "--path-format=absolute", flag], stderr_to_stdout: true) do
       {output, 0} ->
         case String.trim(output) do
           "" -> []
