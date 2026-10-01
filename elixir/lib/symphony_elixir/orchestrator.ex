@@ -235,7 +235,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, reason)
@@ -339,8 +338,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       state
-      | continuations:
-          Map.put(state.continuations, issue.id, %{fingerprint: fingerprint, unchanged: unchanged})
+      | continuations: Map.put(state.continuations, issue.id, %{fingerprint: fingerprint, unchanged: unchanged})
     }
   end
 
