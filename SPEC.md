@@ -455,6 +455,12 @@ Fields:
 - `max_retry_backoff_ms` (integer)
   - Default: `300000` (5 minutes)
   - Changes SHOULD be re-applied at runtime and affect future retry scheduling.
+- `max_unchanged_continuations` (positive integer)
+  - Default: `5`
+  - How many consecutive agent runs MAY end with the work item in the same routing
+    state (state plus label set) before the orchestrator stops continuing it and
+    blocks it.
+  - Invalid values fail configuration validation.
 - `max_concurrent_agents_by_state` (map `state_name -> positive integer`)
   - Default: empty map.
   - State keys are normalized (`trim + lowercase`) for lookup.
@@ -626,6 +632,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents`: integer, default `10`
 - `agent.max_turns`: integer, default `20`
 - `agent.max_retry_backoff_ms`: integer, default `300000` (5m)
+- `agent.max_unchanged_continuations`: positive integer, default `5`
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
@@ -799,9 +806,31 @@ Retry entry creation:
 
 Backoff formula:
 
-- Normal continuation retries after a clean worker exit use a short fixed delay of `1000` ms.
+- Normal continuation retries after a clean worker exit use
+  `delay = min(1000 * 2^(unchanged_streak - 1), agent.max_retry_backoff_ms)`, where
+  `unchanged_streak` is the number of consecutive dispatches of that work item which
+  observed the same routing state. The first is therefore `1000` ms as before.
 - Failure-driven retries use `delay = min(10000 * 2^(attempt - 1), agent.max_retry_backoff_ms)`.
 - Power is capped by the configured max retry backoff (default `300000` / 5m).
+
+Continuation bound:
+
+- A work item's routing fingerprint is its tracked state together with its label set.
+  Nothing else: a turn may write a comment, a description or a title without moving the
+  item anywhere dispatch is decided on.
+- The fingerprint is recorded at dispatch. A dispatch whose fingerprint equals the
+  previous one for that item increments `unchanged_streak`; any change resets it, so
+  work that is progressing is never slowed.
+- When a clean worker exit would schedule the `agent.max_unchanged_continuations`-th
+  consecutive continuation for an unchanged item, the orchestrator does not schedule it.
+  The item is blocked, with the streak, the observed state and labels, and the
+  configured limit in the error, and the claim is retained so polling cannot
+  immediately re-dispatch it.
+- Rationale: a clean exit with the item still active is indistinguishable from progress
+  at the orchestrator level, and nothing counted the repeats. One BIO-CORE work item was
+  re-dispatched 498 times in roughly forty minutes (about 8M tokens), every run redoing
+  work already committed, because completing a run clears the retry attempt counter and
+  the continuation delay was a flat `1000` ms.
 
 Retry handling behavior:
 
@@ -812,6 +841,8 @@ Retry handling behavior:
    - Dispatch if slots are available.
    - Otherwise requeue with error `no available orchestrator slots`.
 5. If found but no longer active or routable, release claim without dispatch.
+
+Releasing a claim also forgets the item's continuation fingerprint and streak.
 
 Note:
 
