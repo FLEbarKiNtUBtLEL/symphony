@@ -41,6 +41,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      # issue_id => %{fingerprint: term(), unchanged: non_neg_integer()}
+      continuations: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -211,17 +213,25 @@ defmodule SymphonyElixir.Orchestrator do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
     else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+      streak = continuation_streak(state, issue_id)
+      limit = Config.settings!().agent.max_unchanged_continuations
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      if streak >= limit do
+        stop_unchanged_continuations(state, issue_id, running_entry, session_id, streak, limit)
+      else
+        Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+        state
+        |> complete_issue(issue_id)
+        |> schedule_issue_retry(issue_id, 1, %{
+          identifier: running_entry.identifier,
+          issue_url: running_entry.issue.url,
+          delay_type: :continuation,
+          continuation_streak: streak,
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+      end
     end
   end
 
@@ -253,6 +263,83 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path)
     })
+  end
+
+  # A CONTINUATION LOOP THAT NOTHING WAS COUNTING.
+  #
+  # A run that exits :normal with the work item still active is re-dispatched a
+  # second later. That is correct for work in progress and unbounded for work
+  # that is not: completing a run clears `retry_attempts`, so the attempt
+  # counter resets every time and the delay stays at one second forever. The
+  # loop never fails, so no failure backoff ever applies to it.
+  #
+  # Observed on BIO-CORE GH-193: a QA turn committed its verification.json
+  # without advancing the stage label, which left the item genuinely
+  # dispatchable, and it was re-dispatched 498 times in roughly forty minutes
+  # for about 8M tokens. Every turn redid work that was already in the tree.
+  #
+  # So count consecutive dispatches that saw the same routing state, back off
+  # geometrically from the existing one-second base, and stop after
+  # `agent.max_unchanged_continuations` of them. Progress resets the count, so
+  # work that is actually moving is never slowed.
+  defp stop_unchanged_continuations(%State{} = state, issue_id, running_entry, session_id, streak, limit) do
+    error =
+      "continuation stopped: #{streak} consecutive agent runs left the work item at " <>
+        "#{describe_fingerprint(state, issue_id)} (agent.max_unchanged_continuations=#{limit}). " <>
+        "Advance or withdraw the work item before dispatching it again."
+
+    Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; #{error}")
+
+    block_issue_from_entry(state, issue_id, running_entry, error)
+  end
+
+  # The number of consecutive dispatches of this work item that saw the same
+  # routing state, counting the run that has just ended.
+  defp continuation_streak(%State{continuations: continuations}, issue_id) do
+    case Map.get(continuations, issue_id) do
+      %{unchanged: n} when is_integer(n) -> n + 1
+      _ -> 1
+    end
+  end
+
+  defp describe_fingerprint(%State{continuations: continuations}, issue_id) do
+    case Map.get(continuations, issue_id) do
+      %{fingerprint: {state, labels}} when is_list(labels) ->
+        "state=#{inspect(state)} labels=#{inspect(labels)}"
+
+      _ ->
+        "the same state"
+    end
+  end
+
+  # State and labels ONLY. These are what dispatch is decided on, so a turn that
+  # changes neither has not moved the item anywhere the orchestrator can see.
+  # `updated_at` and `description` are deliberately excluded: a turn can write a
+  # workpad comment while making no routing progress, and either field would
+  # then reset the count on every pass and the bound would never bind.
+  defp issue_fingerprint(%Issue{state: issue_state, labels: labels}) do
+    {to_string(issue_state), labels |> List.wrap() |> Enum.map(&to_string/1) |> Enum.sort()}
+  end
+
+  # Not an Issue: whether this repeats a previous dispatch cannot be
+  # established, and an unestablished repeat must not be counted as one.
+  defp issue_fingerprint(_issue), do: :unknown
+
+  defp record_dispatch_fingerprint(%State{} = state, issue) do
+    fingerprint = issue_fingerprint(issue)
+    previous = Map.get(state.continuations, issue.id)
+
+    unchanged =
+      case {fingerprint, previous} do
+        {:unknown, _} -> 0
+        {same, %{fingerprint: same, unchanged: n}} when is_integer(n) -> n + 1
+        _ -> 0
+      end
+
+    %{
+      state
+      | continuations: Map.put(state.continuations, issue.id, %{fingerprint: fingerprint, unchanged: unchanged})
+    }
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -381,6 +468,18 @@ defmodule SymphonyElixir.Orchestrator do
       when is_binary(issue_id) and is_integer(attempt) and attempt >= 0 and is_map(metadata) do
     {:noreply, updated_state} = handle_retry_issue_lookup(issue, state, issue_id, attempt, metadata)
     updated_state
+  end
+
+  @doc false
+  @spec record_dispatch_fingerprint_for_test(term(), Issue.t()) :: term()
+  def record_dispatch_fingerprint_for_test(%State{} = state, %Issue{} = issue) do
+    record_dispatch_fingerprint(state, issue)
+  end
+
+  @doc false
+  @spec retry_delay_for_test(pos_integer(), map()) :: pos_integer()
+  def retry_delay_for_test(attempt, metadata) when is_integer(attempt) and is_map(metadata) do
+    retry_delay(attempt, metadata)
   end
 
   @doc false
@@ -775,6 +874,7 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        continuations: Map.delete(state.continuations, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
@@ -985,12 +1085,15 @@ defmodule SymphonyElixir.Orchestrator do
             started_at: DateTime.utc_now()
           })
 
-        %{
-          state
-          | running: running,
-            claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
-        }
+        record_dispatch_fingerprint(
+          %{
+            state
+            | running: running,
+              claimed: MapSet.put(state.claimed, issue.id),
+              retry_attempts: Map.delete(state.retry_attempts, issue.id)
+          },
+          issue
+        )
 
       {:error, reason} ->
         Logger.error("Unable to spawn agent for #{issue_context(issue)}: #{inspect(reason)}")
@@ -1227,17 +1330,28 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+        retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        continuations: Map.delete(state.continuations, issue_id)
     }
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
     if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
+      continuation_retry_delay(metadata[:continuation_streak])
     else
       failure_retry_delay(attempt)
     end
   end
+
+  # The first continuation keeps the one-second responsiveness it has always
+  # had. Each further one that saw no change doubles, capped by the same
+  # configured ceiling as failure backoff.
+  defp continuation_retry_delay(streak) when is_integer(streak) and streak > 0 do
+    max_delay_power = min(streak - 1, 10)
+    min(@continuation_retry_delay_ms * (1 <<< max_delay_power), Config.settings!().agent.max_retry_backoff_ms)
+  end
+
+  defp continuation_retry_delay(_streak), do: @continuation_retry_delay_ms
 
   defp failure_retry_delay(attempt) do
     max_delay_power = min(attempt - 1, 10)

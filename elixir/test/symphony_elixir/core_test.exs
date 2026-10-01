@@ -1059,6 +1059,170 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
+  # GH-193 was re-dispatched 498 times in about forty minutes for roughly 8M
+  # tokens. Nothing in the loop was failing: each run exited :normal with the
+  # work item still active, so a continuation was scheduled one second later,
+  # and because completing a run clears retry_attempts the delay never grew.
+  # These tests pin the bound, and -- as importantly -- pin that progress is
+  # not slowed by it.
+  defp continuation_orchestrator(name) do
+    {:ok, pid} = Orchestrator.start_link(name: Module.concat(__MODULE__, name))
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: Process.exit(pid, :normal)
+    end)
+
+    pid
+  end
+
+  defp put_continuation_state(pid, issue_id, running_entry, continuations) do
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+      |> Map.put(:continuations, continuations)
+    end)
+  end
+
+  defp continuation_running_entry(ref, issue) do
+    %{
+      pid: self(),
+      ref: ref,
+      identifier: issue.identifier,
+      issue: issue,
+      started_at: DateTime.utc_now()
+    }
+  end
+
+  test "a continuation that saw no change backs off instead of retrying in one second" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_unchanged_continuations: 10)
+
+    issue_id = "issue-unchanged-backoff"
+    ref = make_ref()
+    pid = continuation_orchestrator(:ContinuationBackoffOrchestrator)
+
+    issue = %Issue{id: issue_id, identifier: "MT-900", state: "In Progress", labels: ["stage:qa"]}
+
+    # Three dispatches have already seen this same routing state.
+    put_continuation_state(pid, issue_id, continuation_running_entry(ref, issue), %{
+      issue_id => %{fingerprint: {"In Progress", ["stage:qa"]}, unchanged: 3}
+    })
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    # streak 4 -> 1_000 <<< 3 == 8_000ms, where the old code waited 1_000ms
+    # regardless of how many times round the loop had been.
+    assert_due_in_range(due_at_ms, 7_000, 8_600)
+    refute Map.has_key?(state.blocked, issue_id)
+  end
+
+  test "continuation stops after max_unchanged_continuations and says so" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_unchanged_continuations: 3)
+
+    issue_id = "issue-unchanged-stop"
+    ref = make_ref()
+    pid = continuation_orchestrator(:ContinuationStopOrchestrator)
+
+    issue = %Issue{id: issue_id, identifier: "MT-901", state: "In Progress", labels: ["agent-qa", "stage:qa"]}
+
+    put_continuation_state(pid, issue_id, continuation_running_entry(ref, issue), %{
+      issue_id => %{fingerprint: {"In Progress", ["agent-qa", "stage:qa"]}, unchanged: 2}
+    })
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{error: error} = state.blocked[issue_id]
+    assert error =~ "continuation stopped: 3 consecutive agent runs"
+    assert error =~ "agent.max_unchanged_continuations=3"
+    assert error =~ "stage:qa"
+    # The claim is kept so polling cannot pick the item straight back up.
+    assert MapSet.member?(state.claimed, issue_id)
+    refute Map.has_key?(state.continuations, issue_id)
+  end
+
+  test "WORK THAT IS MOVING IS NOT SLOWED: a changed state or label resets the count" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_unchanged_continuations: 3)
+
+    issue_id = "issue-progressing"
+    ref = make_ref()
+    pid = continuation_orchestrator(:ContinuationProgressOrchestrator)
+
+    # The item advanced from stage:qa to stage:validation during the last run,
+    # which is what a continuation is FOR. A bound that counted this would
+    # throttle and eventually block work that is making progress.
+    issue = %Issue{id: issue_id, identifier: "MT-902", state: "In Progress", labels: ["stage:validation"]}
+
+    put_continuation_state(pid, issue_id, continuation_running_entry(ref, issue), %{
+      issue_id => %{fingerprint: {"In Progress", ["stage:qa"]}, unchanged: 2}
+    })
+
+    state = Orchestrator.record_dispatch_fingerprint_for_test(:sys.get_state(pid), issue)
+    assert %{unchanged: 0} = state.continuations[issue_id]
+
+    :sys.replace_state(pid, fn _ -> state end)
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.blocked, issue_id)
+    assert %{due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "the fingerprint ignores everything but state and labels" do
+    issue_id = "issue-fingerprint"
+    pid = continuation_orchestrator(:ContinuationFingerprintOrchestrator)
+    base = %Issue{id: issue_id, identifier: "MT-903", state: "In Progress", labels: ["stage:qa"]}
+
+    first = Orchestrator.record_dispatch_fingerprint_for_test(:sys.get_state(pid), base)
+    assert %{unchanged: 0} = first.continuations[issue_id]
+
+    # A turn can write a workpad comment, a description or a title without
+    # moving the item anywhere the orchestrator routes on. If updated_at or the
+    # description were in the fingerprint the count would reset every pass and
+    # the bound would never bind -- which is the loop, back again.
+    churned = %{base | description: "another workpad comment", title: "retitled", updated_at: DateTime.utc_now()}
+    second = Orchestrator.record_dispatch_fingerprint_for_test(first, churned)
+    assert %{unchanged: 1} = second.continuations[issue_id]
+
+    # Label order is not a change either.
+    reordered = %{base | labels: ["stage:qa"]}
+    third = Orchestrator.record_dispatch_fingerprint_for_test(second, reordered)
+    assert %{unchanged: 2} = third.continuations[issue_id]
+
+    moved = %{base | labels: ["stage:validation"]}
+    fourth = Orchestrator.record_dispatch_fingerprint_for_test(third, moved)
+    assert %{unchanged: 0} = fourth.continuations[issue_id]
+  end
+
+  test "continuation delay doubles per unchanged run and is capped by max_retry_backoff_ms" do
+    write_workflow_file!(Workflow.workflow_file_path(), max_retry_backoff_ms: 20_000)
+
+    delay = fn streak ->
+      Orchestrator.retry_delay_for_test(1, %{delay_type: :continuation, continuation_streak: streak})
+    end
+
+    assert delay.(1) == 1_000
+    assert delay.(2) == 2_000
+    assert delay.(3) == 4_000
+    assert delay.(4) == 8_000
+    assert delay.(5) == 16_000
+    assert delay.(6) == 20_000, "capped by the same ceiling as failure backoff"
+    assert delay.(30) == 20_000
+
+    # An absent streak keeps the behaviour the first continuation has always had.
+    assert Orchestrator.retry_delay_for_test(1, %{delay_type: :continuation}) == 1_000
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
