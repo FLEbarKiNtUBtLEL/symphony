@@ -13,12 +13,13 @@
 # committed review artifact, which this deliberately does not do.
 name: GH-225 review-state probe
 
+# `pull_request` rather than `workflow_dispatch`: a dispatchable workflow must
+# live on the default branch, and this one is deliberately confined to a
+# throwaway branch. A same-repository pull request still grants the token the
+# permissions declared below.
 on:
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: Pull request number to submit a probe review on
-        required: true
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -31,7 +32,7 @@ jobs:
       - name: Submit CHANGES_REQUESTED as github-actions[bot]
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR: ${{ inputs.pr }}
+          PR: ${{ github.event.pull_request.number }}
         run: |
           set -uo pipefail
           echo "actor: $(gh api user -q .login 2>/dev/null || echo '(token is not a user)')"
