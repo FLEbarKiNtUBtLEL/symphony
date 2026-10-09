@@ -1,0 +1,52 @@
+# GH-225 PROBE, TEMPORARY. Delete after it answers its one question.
+#
+# Can `github-actions[bot]` set CHANGES_REQUESTED on a pull request authored by
+# the repository owner? The owner's own credential cannot: GitHub answers 422
+# because the submitting identity owns the PR, which is the GH-225 defect. The
+# Actions token is a DIFFERENT actor, so the rule should not reach it -- but that
+# has never been tried here, because no workflow has ever held
+# `pull-requests: write`.
+#
+# This writes nothing but a review on a pull request named by hand. It reads no
+# candidate bytes, checks out nothing, and computes no verdict: it is a capability
+# probe, not the GH-225 remedy. The remedy would project a verdict from the
+# committed review artifact, which this deliberately does not do.
+name: GH-225 review-state probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to submit a probe review on
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write   # the new capability under test; nothing else needs it
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Submit CHANGES_REQUESTED as github-actions[bot]
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ inputs.pr }}
+        run: |
+          set -uo pipefail
+          echo "actor: $(gh api user -q .login 2>/dev/null || echo '(token is not a user)')"
+          set +e
+          out=$(gh api -X POST "repos/${{ github.repository }}/pulls/$PR/reviews" \
+            -f event=REQUEST_CHANGES \
+            -f body='GH-225 capability probe: can github-actions[bot] set a formal review state on an owner-authored PR? This review carries no verdict and blocks nothing.' \
+            2>&1)
+          status=$?
+          set -e
+          echo "exit=$status"
+          echo "$out" | head -20
+          if [ "$status" -eq 0 ]; then
+            echo "RESULT: the bot CAN set a formal review state."
+          else
+            echo "RESULT: the bot CANNOT. The 422 is not about which identity submits."
+          fi
+          exit 0   # a refusal is a valid answer; do not fail the run
