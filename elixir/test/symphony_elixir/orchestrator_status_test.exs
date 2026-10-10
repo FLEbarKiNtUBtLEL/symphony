@@ -1682,6 +1682,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert StatusDashboard.humanize_codex_message(message) == "git status --short"
   end
 
+  test "an auto-answer failure is not reported as a request for operator input" do
+    # A run can stop with the operator told it is "waiting for user input" when no
+    # approval or input request was ever made: the auto-answer failed and returned
+    # :input_required bare, which the dashboard rendered identically to a real
+    # turn/input_required frame. The two causes must not read the same.
+    genuine = StatusDashboard.humanize_codex_message(%{event: :turn_input_required, message: %{}})
+    fallback =
+      StatusDashboard.humanize_codex_message(%{
+        event: :approval_auto_answer_unavailable,
+        message: %{payload: %{"method" => "tool/requestUserInput"}, raw: "{}"}
+      })
+
+    assert genuine =~ "waiting for user input"
+    assert fallback =~ "could not be auto-answered"
+    assert fallback =~ "no operator request was made"
+    refute fallback == genuine
+    # And the fallback must not claim an operator was asked for anything.
+    refute fallback =~ "waiting for user input"
+  end
+
   test "status dashboard formats auto-approval updates from codex" do
     message = %{
       event: :approval_auto_approved,

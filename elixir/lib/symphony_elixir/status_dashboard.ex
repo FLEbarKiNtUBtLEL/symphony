@@ -1107,6 +1107,20 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp humanize_codex_event(:turn_input_required, _message, _payload), do: "turn blocked: waiting for user input"
 
+  # A run out of capacity is not a run waiting for an operator. Reporting the second
+  # for the first sends the operator looking for an approval prompt that was never
+  # made.
+  defp humanize_codex_event(:usage_limit_reached, _message, payload) do
+    phrase = (is_map(payload) && Map.get(payload, :phrase)) || "usage limit"
+    "turn stopped: provider capacity exhausted (#{phrase}) -- not an operator request"
+  end
+
+  # A DIFFERENT cause from the line above, and the distinction is the point: this one
+  # means the auto-answer could not construct answers, not that the model asked a
+  # question. Reported identically, the two are indistinguishable to an operator.
+  defp humanize_codex_event(:approval_auto_answer_unavailable, _message, _payload),
+    do: "turn blocked: approval could not be auto-answered (no operator request was made)"
+
   defp humanize_codex_event(:approval_auto_approved, message, payload) do
     method =
       map_value(payload, ["method", :method]) ||

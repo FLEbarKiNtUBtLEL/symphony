@@ -3,6 +3,7 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   Provider-native GitHub REST tool exposed to Codex app-server turns.
   """
 
+  alias SymphonyElixir.RunCause
   alias SymphonyElixir.GitHub.Client
 
   @github_api_tool "github_api"
@@ -62,6 +63,10 @@ defmodule SymphonyElixir.GitHub.AgentTool do
          {:ok, %{status: status, body: response_body}} <-
            github_client.(method, path, params, body, client_opts),
          true <- is_integer(status) do
+      # The one place the runtime can tell a self-withdrawal from an external stop.
+      # Noted only on success, because a call the API rejected changed nothing.
+      maybe_note_self_withdrawal(status, method, path, Keyword.get(opts, :issue))
+
       rest_response(status, response_body)
     else
       {:error, reason} -> failure_response(tool_error_payload(reason))
@@ -170,4 +175,80 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   end
 
   defp supported_tool_names, do: Enum.map(tool_specs(), & &1["name"])
+
+  # An agent that withdraws itself does it through this tool: it removes its
+  # own dispatch label, or assigns the issue away, so the orchestrator's next poll
+  # stops routing the issue to this worker. The poll sees only that result and cannot
+  # tell it from a cancellation or a crash.
+  #
+  # ONLY ROUTING MUTATIONS COUNT. An agent writes comments and pushes labels that have
+  # nothing to do with routing; treating those as withdrawals would report every
+  # chatty agent as having escalated. The test is narrow on purpose: a mutating method,
+  # against this issue's own labels or assignees.
+  defp maybe_note_self_withdrawal(status, method, path, issue)
+       when status in 200..299 and is_binary(method) and is_binary(path) do
+    with true <- method in ["POST", "PATCH", "PUT", "DELETE"],
+         {:ok, issue_id, number} <- issue_identity(issue),
+         true <- routing_path?(path, number) do
+      RunCause.record(issue_id, method, path, context: issue_context_for(issue, issue_id))
+    else
+      _ -> :ok
+    end
+  end
+
+  defp maybe_note_self_withdrawal(_status, _method, _path, _issue), do: :ok
+
+  # The issue the turn is bound to, as app-server passes it in. Both the id the
+  # orchestrator keys its state by and the tracker's own number are needed: the first
+  # to record against, the second to recognise the path.
+  defp issue_identity(%{id: id} = issue) when not is_nil(id) do
+    case issue_number(issue) do
+      nil -> :error
+      number -> {:ok, id, number}
+    end
+  end
+
+  defp issue_identity(_issue), do: :error
+
+  defp issue_number(%{number: number}) when is_integer(number), do: number
+
+  defp issue_number(%{identifier: identifier}) when is_binary(identifier) do
+    case Regex.run(~r/(\d+)\s*$/, identifier) do
+      [_, digits] -> String.to_integer(digits)
+      _ -> nil
+    end
+  end
+
+  defp issue_number(%{id: id}) when is_integer(id), do: id
+
+  defp issue_number(%{id: id}) when is_binary(id) do
+    case Integer.parse(id) do
+      {number, ""} -> number
+      _ -> nil
+    end
+  end
+
+  defp issue_number(_issue), do: nil
+
+  # `/repos/:owner/:repo/issues/<n>/labels...` and `.../assignees...`, plus the issue
+  # itself, which PATCH uses to change assignees or state. Anchored on the issue's own
+  # number so an agent touching a DIFFERENT issue is not recorded against this one.
+  defp routing_path?(path, number) do
+    trimmed = path |> String.split("?") |> List.first() |> String.trim_trailing("/")
+
+    Regex.match?(
+      ~r{^/repos/[^/]+/[^/]+/issues/#{number}(?:/(?:labels|assignees)(?:/.*)?)?$},
+      trimmed
+    )
+  end
+
+  defp issue_context_for(issue, issue_id) do
+    identifier = Map.get(issue, :identifier) || Map.get(issue, :number)
+
+    case identifier do
+      nil -> "issue_id=#{inspect(issue_id)}"
+      value -> "issue_id=#{inspect(issue_id)} issue_identifier=#{value}"
+    end
+  end
+
 end

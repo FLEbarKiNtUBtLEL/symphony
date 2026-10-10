@@ -27,6 +27,8 @@ defmodule SymphonyElixir.RunLog do
 
   require Logger
 
+  alias SymphonyElixir.RunCause
+
   alias SymphonyElixir.LogFile
 
   @filename "symphony-runs.jsonl"
@@ -81,7 +83,7 @@ defmodule SymphonyElixir.RunLog do
 
     try do
       result = fun.()
-      record(issue, opts, started_at, started_ms, outcome_of(result))
+      record(issue, opts, started_at, started_ms, with_cause(issue, outcome_of(result)))
       result
     rescue
       exception ->
@@ -93,6 +95,21 @@ defmodule SymphonyElixir.RunLog do
         :erlang.raise(kind, value, __STACKTRACE__)
     end
   end
+
+  # A recorded cause belongs in the run's own line, because this file is what
+  # survives the VM and answers "why did this run end" without grepping prose. The
+  # outcome is left alone -- a crash or an error is the more important fact -- and the
+  # cause is added to the detail beside it.
+  defp with_cause(issue, {outcome, detail}) do
+    case issue |> issue_id_for_cause() |> RunCause.summary() do
+      nil -> {outcome, detail}
+      cause when is_nil(detail) -> {outcome, cause}
+      cause -> {outcome, "#{detail}; #{cause}"}
+    end
+  end
+
+  defp issue_id_for_cause(%{id: id}), do: id
+  defp issue_id_for_cause(_issue), do: nil
 
   defp outcome_of(:ok), do: {"ok", nil}
   defp outcome_of({:error, reason}), do: {"error", inspect(reason)}

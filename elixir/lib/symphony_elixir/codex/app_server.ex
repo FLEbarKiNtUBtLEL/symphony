@@ -4,6 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
+  alias SymphonyElixir.Codex.StopCause
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
 
   @initialize_id 1
@@ -402,6 +403,12 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
     payload_string = to_string(data)
+
+    # Notice exhausted capacity, which arrives only as vendor prose inside a frame.
+    # Checked on the RAW string so it is seen wherever the vendor puts it, and emitted
+    # as an extra event rather than used for control flow -- if the wording changes,
+    # this stops adding the event and nothing else changes.
+    maybe_emit_usage_limit(on_message, payload_string)
 
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
@@ -830,6 +837,18 @@ defmodule SymphonyElixir.Codex.AppServer do
         :approved
 
       :error ->
+        # SAY WHY. `:input_required` is the right outcome -- a human must answer -- but
+        # returning it bare makes this indistinguishable from a real
+        # `turn/input_required` frame, so an operator can be told a run is waiting for
+        # input when no request was ever made. Emitting a distinct cause first keeps
+        # the behaviour and makes the reason legible in the run log and dashboard.
+        emit_message(
+          on_message,
+          :approval_auto_answer_unavailable,
+          %{payload: payload, raw: payload_string},
+          metadata
+        )
+
         :input_required
     end
   end
@@ -1081,4 +1100,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp needs_input_field?(_payload), do: false
+
+  # See SymphonyElixir.Codex.StopCause for why this is advisory.
+  defp maybe_emit_usage_limit(on_message, payload_string) do
+    case StopCause.usage_limit(payload_string) do
+      {:match, %{phrase: phrase}} ->
+        emit_message(
+          on_message,
+          :usage_limit_reached,
+          %{phrase: phrase, raw: payload_string},
+          %{}
+        )
+
+      :no_match ->
+        :ok
+    end
+  end
+
 end

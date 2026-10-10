@@ -7,6 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
+  alias SymphonyElixir.RunCause
+
   alias SymphonyElixir.RunLog
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
@@ -527,7 +529,20 @@ defmodule SymphonyElixir.Orchestrator do
         terminate_running_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
-        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
+        # NAME THE CAUSE. This branch fires identically for an agent that withdrew
+        # itself -- removed one of its own required labels because it judged a human
+        # must decide -- and for an external cancellation, timeout or crash. With one
+        # line for both, attributing a past stop meant reading the agent transcript,
+        # this log and the tracker's timeline together.
+        #
+        # `:external` is the default and that is deliberate: an absence of observation
+        # must never be reported as an agent-authored escalation.
+        Logger.info(
+          "Issue no longer routed to this worker: #{issue_context(issue)} " <>
+            "assignee=#{inspect(issue.assignee_id)} #{withdrawal_cause(issue.id)}; stopping active agent"
+        )
+
+        RunCause.forget(issue.id)
 
         terminate_running_issue(state, issue.id, false)
 
@@ -562,7 +577,15 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
-        Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
+        # The same ambiguity on the blocked path. Fixed here too rather than only on
+        # the route where it was noticed, because a cause that is legible on one path
+        # and silent on its sibling is the gap reappearing under another name.
+        Logger.info(
+          "Blocked issue no longer routed to this worker: #{issue_context(issue)} " <>
+            "assignee=#{inspect(issue.assignee_id)} #{withdrawal_cause(issue.id)}; releasing block"
+        )
+
+        RunCause.forget(issue.id)
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -2109,4 +2132,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  # How the stop should be described, from the runtime's own observation.
+  defp withdrawal_cause(issue_id) do
+    case RunCause.classify(issue_id) do
+      {:self_withdrawal, %{method: method, path: path, observed_at: at}} ->
+        "cause=self_withdrawal observed_at=#{DateTime.to_iso8601(at)} via=\"#{method} #{path}\""
+
+      :external ->
+        "cause=external_no_agent_action_observed"
+    end
+  end
+
 end
