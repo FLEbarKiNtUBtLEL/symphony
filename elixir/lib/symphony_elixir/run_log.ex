@@ -87,11 +87,11 @@ defmodule SymphonyElixir.RunLog do
       result
     rescue
       exception ->
-        record(issue, opts, started_at, started_ms, {"crash", Exception.message(exception)})
+        record(issue, opts, started_at, started_ms, with_cause(issue, {"crash", Exception.message(exception)}))
         reraise(exception, __STACKTRACE__)
     catch
       kind, value ->
-        record(issue, opts, started_at, started_ms, {"crash", "#{kind}: #{inspect(value)}"})
+        record(issue, opts, started_at, started_ms, with_cause(issue, {"crash", "#{kind}: #{inspect(value)}"}))
         :erlang.raise(kind, value, __STACKTRACE__)
     end
   end

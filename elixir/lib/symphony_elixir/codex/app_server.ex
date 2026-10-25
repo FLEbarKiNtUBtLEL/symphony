@@ -5,7 +5,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   require Logger
   alias SymphonyElixir.Codex.StopCause
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, RunCause, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -85,7 +85,19 @@ defmodule SymphonyElixir.Codex.AppServer do
         issue,
         opts \\ []
       ) do
-    on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    callback = Keyword.get(opts, :on_message, &default_on_message/1)
+
+    on_message = fn message ->
+      case message do
+        %{event: :usage_limit_reached, phrase: phrase} ->
+          RunCause.record_usage_limit(issue.id, phrase)
+
+        _ ->
+          :ok
+      end
+
+      callback.(message)
+    end
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
@@ -123,9 +135,15 @@ defmodule SymphonyElixir.Codex.AppServer do
           {:error, reason} ->
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
+            event =
+              case reason do
+                {:approval_auto_answer_unavailable, _payload} -> :approval_auto_answer_unavailable
+                _ -> :turn_ended_with_error
+              end
+
             emit_message(
               on_message,
-              :turn_ended_with_error,
+              event,
               %{
                 session_id: session_id,
                 reason: reason
@@ -529,6 +547,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:turn_input_required, payload}}
 
+      :approval_auto_answer_unavailable ->
+        {:error, {:approval_auto_answer_unavailable, payload}}
+
       :approved ->
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
@@ -837,19 +858,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         :approved
 
       :error ->
-        # SAY WHY. `:input_required` is the right outcome -- a human must answer -- but
-        # returning it bare makes this indistinguishable from a real
-        # `turn/input_required` frame, so an operator can be told a run is waiting for
-        # input when no request was ever made. Emitting a distinct cause first keeps
-        # the behaviour and makes the reason legible in the run log and dashboard.
-        emit_message(
-          on_message,
-          :approval_auto_answer_unavailable,
-          %{payload: payload, raw: payload_string},
-          metadata
-        )
-
-        :input_required
+        # Keep this distinct through the final event, rather than overwriting it
+        # with the generic operator-input or turn-error status.
+        :approval_auto_answer_unavailable
     end
   end
 
