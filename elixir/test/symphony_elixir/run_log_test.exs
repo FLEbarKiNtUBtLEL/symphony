@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.RunLogTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.RunLog
   alias SymphonyElixir.RunCause
+  alias SymphonyElixir.RunLog
 
   setup do
     dir = Path.join(System.tmp_dir!(), "symphony-run-log-#{System.unique_integer([:positive])}")
@@ -132,6 +132,13 @@ defmodule SymphonyElixir.RunLogTest do
     assert thrown["detail"] == "throw: :withdrawn; self_withdrawal via PATCH /repos/owner/repo/issues/63"
     assert exited["outcome"] == "crash"
     assert exited["detail"] == "exit: :provider_stopped; usage_limit: usage limit reached"
+  end
+
+  test "an issue map without an atom id records the run with no cause attached" do
+    assert :ok == RunLog.measure(%{"id" => "string-keyed", "identifier" => "GH-9"}, [], fn -> :ok end)
+    assert [entry] = RunLog.recent(100, issue_identifier: "GH-9")
+    assert entry["outcome"] == "ok"
+    assert entry["detail"] == nil
   end
 
   test "recent/2 returns newest first and honours the limit" do

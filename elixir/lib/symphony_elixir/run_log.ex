@@ -226,18 +226,17 @@ defmodule SymphonyElixir.RunLog do
         contents
         |> String.split("\n", trim: true)
         |> Enum.reverse()
-        |> Enum.find_value(fn line ->
-          case decode_line(line) do
-            %{"event" => "rate_limits", "limits" => limits, "observed_at" => at} ->
-              {limits, at}
-
-            _ ->
-              nil
-          end
-        end)
+        |> Enum.find_value(&rate_limits_from_line/1)
 
       _ ->
         nil
+    end
+  end
+
+  defp rate_limits_from_line(line) do
+    case decode_line(line) do
+      %{"event" => "rate_limits", "limits" => limits, "observed_at" => at} -> {limits, at}
+      _ -> nil
     end
   end
 

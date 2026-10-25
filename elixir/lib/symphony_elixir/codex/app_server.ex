@@ -4,8 +4,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.StopCause
   alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, RunCause, SSH}
+  alias SymphonyElixir.Codex.StopCause
 
   @initialize_id 1
   @thread_start_id 2
@@ -135,15 +135,9 @@ defmodule SymphonyElixir.Codex.AppServer do
           {:error, reason} ->
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
-            event =
-              case reason do
-                {:approval_auto_answer_unavailable, _payload} -> :approval_auto_answer_unavailable
-                _ -> :turn_ended_with_error
-              end
-
             emit_message(
               on_message,
-              event,
+              turn_error_event(reason),
               %{
                 session_id: session_id,
                 reason: reason
@@ -1112,6 +1106,9 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp needs_input_field?(_payload), do: false
 
+  defp turn_error_event({:approval_auto_answer_unavailable, _payload}), do: :approval_auto_answer_unavailable
+  defp turn_error_event(_reason), do: :turn_ended_with_error
+
   # See SymphonyElixir.Codex.StopCause for why this is advisory.
   defp maybe_emit_usage_limit(on_message, payload_string) do
     case StopCause.usage_limit(payload_string) do
@@ -1127,5 +1124,4 @@ defmodule SymphonyElixir.Codex.AppServer do
         :ok
     end
   end
-
 end

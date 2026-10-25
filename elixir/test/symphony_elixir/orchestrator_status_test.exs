@@ -1688,6 +1688,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     # :input_required bare, which the dashboard rendered identically to a real
     # turn/input_required frame. The two causes must not read the same.
     genuine = StatusDashboard.humanize_codex_message(%{event: :turn_input_required, message: %{}})
+
     fallback =
       StatusDashboard.humanize_codex_message(%{
         event: :approval_auto_answer_unavailable,

@@ -1,8 +1,8 @@
 defmodule SymphonyElixir.RunCauseTest do
   use ExUnit.Case, async: false
 
-  alias SymphonyElixir.RunCause
   alias SymphonyElixir.GitHub.AgentTool
+  alias SymphonyElixir.RunCause
 
   setup do
     RunCause.reset_for_test()
@@ -65,6 +65,29 @@ defmodule SymphonyElixir.RunCauseTest do
       RunCause.reset_for_test()
       run(method, path)
       assert RunCause.classify(42) == :external, "#{method} #{path}"
+    end
+  end
+
+  test "the issue number is recovered from whichever identity field the turn carries" do
+    path = "/repos/owner/repo/issues/207/labels/required-label"
+
+    for bound <- [
+          %{id: 207},
+          %{id: "207"},
+          %{id: "207", number: nil}
+        ] do
+      RunCause.reset_for_test()
+      run("DELETE", path, issue: bound)
+      assert {:self_withdrawal, _} = RunCause.classify(bound.id), inspect(bound)
+    end
+  end
+
+  test "an issue whose number cannot be recovered attributes nothing" do
+    # An identifier without digits does not fall back to the id: it names the issue.
+    for bound <- [%{id: "not-a-number"}, %{id: 207, identifier: "no digits"}, %{id: :opaque}, %{id: nil}] do
+      RunCause.reset_for_test()
+      run("DELETE", "/repos/owner/repo/issues/207/labels/required-label", issue: bound)
+      assert RunCause.classify(bound.id) == :external, inspect(bound)
     end
   end
 
@@ -182,7 +205,9 @@ defmodule SymphonyElixir.RunCauseTest do
 
     on_exit(fn ->
       File.rm_rf(tmp)
-      if previous, do: Application.put_env(:symphony_elixir, :run_log_file, previous),
+
+      if previous,
+        do: Application.put_env(:symphony_elixir, :run_log_file, previous),
         else: Application.delete_env(:symphony_elixir, :run_log_file)
     end)
 

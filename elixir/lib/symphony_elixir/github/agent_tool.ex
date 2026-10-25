@@ -3,8 +3,8 @@ defmodule SymphonyElixir.GitHub.AgentTool do
   Provider-native GitHub REST tool exposed to Codex app-server turns.
   """
 
-  alias SymphonyElixir.RunCause
   alias SymphonyElixir.GitHub.Client
+  alias SymphonyElixir.RunCause
 
   @github_api_tool "github_api"
   @allowed_methods ["GET", "POST", "PATCH", "PUT", "DELETE"]
@@ -250,5 +250,4 @@ defmodule SymphonyElixir.GitHub.AgentTool do
       value -> "issue_id=#{inspect(issue_id)} issue_identifier=#{value}"
     end
   end
-
 end

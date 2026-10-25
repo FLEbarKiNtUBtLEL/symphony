@@ -779,8 +779,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_event) in
-      [:turn_input_required, :approval_required, :approval_auto_answer_unavailable] or
+    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required, :approval_auto_answer_unavailable] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
@@ -2157,5 +2156,4 @@ defmodule SymphonyElixir.Orchestrator do
         "cause=external_no_agent_action_observed"
     end
   end
-
 end
