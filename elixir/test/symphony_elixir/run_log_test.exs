@@ -1,6 +1,7 @@
 defmodule SymphonyElixir.RunLogTest do
   use ExUnit.Case, async: false
 
+  alias SymphonyElixir.RunCause
   alias SymphonyElixir.RunLog
 
   setup do
@@ -89,6 +90,55 @@ defmodule SymphonyElixir.RunLogTest do
 
     assert [entry] = RunLog.recent()
     assert entry["outcome"] == "crash"
+  end
+
+  test "a provider failure retains its cause when the agent raises" do
+    issue = %{id: "run-log-provider-failure", identifier: "GH-62"}
+    on_exit(fn -> RunCause.forget(issue.id) end)
+
+    assert_raise RuntimeError, "Agent run failed", fn ->
+      RunLog.measure(issue, [], fn ->
+        RunCause.record_usage_limit(issue.id, "You've hit your usage limit.")
+        raise "Agent run failed"
+      end)
+    end
+
+    assert [entry] = RunLog.recent()
+    assert entry["outcome"] == "crash"
+    assert entry["detail"] == "Agent run failed; usage_limit: You've hit your usage limit."
+    assert {:usage_limit, _} = RunCause.classify(issue.id)
+  end
+
+  test "caught exits and throws retain the cause without changing the signal" do
+    issue = %{id: "run-log-caught-cause", identifier: "GH-63"}
+    on_exit(fn -> RunCause.forget(issue.id) end)
+
+    assert catch_exit(
+             RunLog.measure(issue, [], fn ->
+               RunCause.record_usage_limit(issue.id, "usage limit reached")
+               exit(:provider_stopped)
+             end)
+           ) == :provider_stopped
+
+    assert catch_throw(
+             RunLog.measure(issue, [], fn ->
+               RunCause.record(issue.id, "PATCH", "/repos/owner/repo/issues/63")
+               throw(:withdrawn)
+             end)
+           ) == :withdrawn
+
+    assert [thrown, exited] = RunLog.recent()
+    assert thrown["outcome"] == "crash"
+    assert thrown["detail"] == "throw: :withdrawn; self_withdrawal via PATCH /repos/owner/repo/issues/63"
+    assert exited["outcome"] == "crash"
+    assert exited["detail"] == "exit: :provider_stopped; usage_limit: usage limit reached"
+  end
+
+  test "an issue map without an atom id records the run with no cause attached" do
+    assert :ok == RunLog.measure(%{"id" => "string-keyed", "identifier" => "GH-9"}, [], fn -> :ok end)
+    assert [entry] = RunLog.recent(100, issue_identifier: "GH-9")
+    assert entry["outcome"] == "ok"
+    assert entry["detail"] == nil
   end
 
   test "recent/2 returns newest first and honours the limit" do

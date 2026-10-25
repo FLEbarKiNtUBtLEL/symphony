@@ -38,3 +38,21 @@ When logging Codex execution lifecycle events, include:
 - Is this event tied to a Codex session? Include `session_id`.
 - Is the failure reason present and concise?
 - Is the message format consistent with existing lifecycle logs?
+
+
+## Run stop causes
+
+Self-withdrawal reconciliation uses the routing observation's recorded detail;
+provider-capacity observations use `cause=usage_limit` and preserve the matching
+phrase in the run log, including when a run raises, throws, or exits. These
+capacity observations are advisory and do not change turn control flow.
+
+An automatic approval-answer construction failure remains
+`approval_auto_answer_unavailable` as the final event and blocker explanation,
+rather than being replaced by a generic operator-input event.
+
+The orchestrator owns the live cause's lifetime: it clears causes after stopping
+workers, when releasing claims, and before scheduling another attempt. A new
+dispatch also clears stale observations left by an orchestrator-only restart. Blocked
+claims keep their cause until reconciliation releases them. Run-log writes read
+but do not consume that observation so blocked reconciliation can still name it.

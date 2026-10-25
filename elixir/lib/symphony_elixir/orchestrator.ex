@@ -7,6 +7,8 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
+  alias SymphonyElixir.RunCause
+
   alias SymphonyElixir.RunLog
 
   alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
@@ -527,7 +529,18 @@ defmodule SymphonyElixir.Orchestrator do
         terminate_running_issue(state, issue.id, true)
 
       !issue_routable?(issue) ->
-        Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
+        # NAME THE CAUSE. This branch fires identically for an agent that withdrew
+        # itself -- removed one of its own required labels because it judged a human
+        # must decide -- and for an external cancellation, timeout or crash. With one
+        # line for both, attributing a past stop meant reading the agent transcript,
+        # this log and the tracker's timeline together.
+        #
+        # `:external` is the default and that is deliberate: an absence of observation
+        # must never be reported as an agent-authored escalation.
+        Logger.info(
+          "Issue no longer routed to this worker: #{issue_context(issue)} " <>
+            "assignee=#{inspect(issue.assignee_id)} #{withdrawal_cause(issue.id)}; stopping active agent"
+        )
 
         terminate_running_issue(state, issue.id, false)
 
@@ -562,7 +575,14 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue.id)
 
       !issue_routable?(issue) ->
-        Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
+        # The same ambiguity on the blocked path. Fixed here too rather than only on
+        # the route where it was noticed, because a cause that is legible on one path
+        # and silent on its sibling is the gap reappearing under another name.
+        Logger.info(
+          "Blocked issue no longer routed to this worker: #{issue_context(issue)} " <>
+            "assignee=#{inspect(issue.assignee_id)} #{withdrawal_cause(issue.id)}; releasing block"
+        )
+
         release_issue_claim(state, issue.id)
 
       active_issue_state?(issue.state, active_states) ->
@@ -661,6 +681,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
 
         stop_running_task(pid, ref, state.task_supervisor)
+        RunCause.forget(issue_id)
 
         if cleanup_workspace do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
@@ -758,7 +779,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp last_activity_timestamp(_running_entry), do: nil
 
   defp input_required_blocker?(running_entry) when is_map(running_entry) do
-    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required] or
+    Map.get(running_entry, :last_codex_event) in [:turn_input_required, :approval_required, :approval_auto_answer_unavailable] or
       not is_nil(input_required_completion_outcome(Map.get(running_entry, :completion))) or
       codex_message_method(Map.get(running_entry, :last_codex_message)) ==
         "mcpServer/elicitation/request"
@@ -799,6 +820,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp codex_event_blocker_error(:turn_input_required), do: "codex turn requires operator input"
   defp codex_event_blocker_error(:approval_required), do: "codex turn requires approval"
+
+  defp codex_event_blocker_error(:approval_auto_answer_unavailable),
+    do: "codex approval auto-answer unavailable"
+
   defp codex_event_blocker_error(_event), do: nil
 
   defp completion_blocker_error(completion) do
@@ -1053,6 +1078,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    # Also cover an orchestrator-only restart: the application-owned ledger survives it.
+    RunCause.forget(issue.id)
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -1138,6 +1166,9 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    # The worker has ended before a retry is scheduled. Blocked claims retain
+    # their observation until reconciliation releases them, but a retry is a new run.
+    RunCause.forget(issue_id)
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -1326,6 +1357,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
+    RunCause.forget(issue_id)
+
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
@@ -2109,4 +2142,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp integer_like(_value), do: nil
+
+  # How the stop should be described, from the runtime's own observation.
+  defp withdrawal_cause(issue_id) do
+    case RunCause.classify(issue_id) do
+      {:self_withdrawal, %{detail: detail, observed_at: at}} ->
+        "cause=self_withdrawal observed_at=#{DateTime.to_iso8601(at)} via=#{inspect(detail)}"
+
+      {:usage_limit, %{detail: detail, observed_at: at}} ->
+        "cause=usage_limit observed_at=#{DateTime.to_iso8601(at)} detail=#{inspect(detail)}"
+
+      :external ->
+        "cause=external_no_agent_action_observed"
+    end
+  end
 end

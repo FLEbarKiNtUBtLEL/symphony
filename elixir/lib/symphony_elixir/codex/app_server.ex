@@ -4,7 +4,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, RunCause, SSH}
+  alias SymphonyElixir.Codex.StopCause
 
   @initialize_id 1
   @thread_start_id 2
@@ -84,7 +85,19 @@ defmodule SymphonyElixir.Codex.AppServer do
         issue,
         opts \\ []
       ) do
-    on_message = Keyword.get(opts, :on_message, &default_on_message/1)
+    callback = Keyword.get(opts, :on_message, &default_on_message/1)
+
+    on_message = fn message ->
+      case message do
+        %{event: :usage_limit_reached, phrase: phrase} ->
+          RunCause.record_usage_limit(issue.id, phrase)
+
+        _ ->
+          :ok
+      end
+
+      callback.(message)
+    end
 
     tool_executor =
       Keyword.get(opts, :tool_executor, fn tool, arguments ->
@@ -124,7 +137,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
             emit_message(
               on_message,
-              :turn_ended_with_error,
+              turn_error_event(reason),
               %{
                 session_id: session_id,
                 reason: reason
@@ -403,6 +416,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp handle_incoming(port, on_message, data, timeout_ms, tool_executor, auto_approve_requests) do
     payload_string = to_string(data)
 
+    # Notice exhausted capacity, which arrives only as vendor prose inside a frame.
+    # Checked on the RAW string so it is seen wherever the vendor puts it, and emitted
+    # as an extra event rather than used for control flow -- if the wording changes,
+    # this stops adding the event and nothing else changes.
+    maybe_emit_usage_limit(on_message, payload_string)
+
     case Jason.decode(payload_string) do
       {:ok, %{"method" => "turn/completed"} = payload} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
@@ -521,6 +540,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
         {:error, {:turn_input_required, payload}}
+
+      :approval_auto_answer_unavailable ->
+        {:error, {:approval_auto_answer_unavailable, payload}}
 
       :approved ->
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
@@ -830,7 +852,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         :approved
 
       :error ->
-        :input_required
+        # Keep this distinct through the final event, rather than overwriting it
+        # with the generic operator-input or turn-error status.
+        :approval_auto_answer_unavailable
     end
   end
 
@@ -1081,4 +1105,23 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp needs_input_field?(_payload), do: false
+
+  defp turn_error_event({:approval_auto_answer_unavailable, _payload}), do: :approval_auto_answer_unavailable
+  defp turn_error_event(_reason), do: :turn_ended_with_error
+
+  # See SymphonyElixir.Codex.StopCause for why this is advisory.
+  defp maybe_emit_usage_limit(on_message, payload_string) do
+    case StopCause.usage_limit(payload_string) do
+      {:match, %{phrase: phrase}} ->
+        emit_message(
+          on_message,
+          :usage_limit_reached,
+          %{phrase: phrase, raw: payload_string},
+          %{}
+        )
+
+      :no_match ->
+        :ok
+    end
+  end
 end

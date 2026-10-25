@@ -1,6 +1,89 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixir.{RunCause, RunLog}
+
+  test "usage-limit frames reach the run ledger before the callback without changing control flow" do
+    test_root = Path.join(System.tmp_dir!(), "symphony-usage-limit-#{System.unique_integer([:positive])}")
+    workspace_root = Path.join(test_root, "workspaces")
+    workspace = Path.join(workspace_root, "MT-USAGE")
+    codex_binary = Path.join(test_root, "fake-codex")
+    log_file = Path.join(test_root, "runs.jsonl")
+    previous_log = Application.get_env(:symphony_elixir, :run_log_file)
+    issue = %Issue{id: "usage-limit-#{System.unique_integer([:positive])}", identifier: "MT-USAGE", title: "Usage limit"}
+
+    on_exit(fn ->
+      if is_nil(previous_log),
+        do: Application.delete_env(:symphony_elixir, :run_log_file),
+        else: Application.put_env(:symphony_elixir, :run_log_file, previous_log)
+
+      RunCause.forget(issue.id)
+      File.rm_rf(test_root)
+    end)
+
+    File.mkdir_p!(workspace)
+    Application.put_env(:symphony_elixir, :run_log_file, log_file)
+
+    for {text, expected} <- [{"Quota exceeded for this account", "Quota exceeded"}, {"Unrecognised vendor wording", nil}] do
+      RunCause.forget(issue.id)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+          3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-usage"}}}' ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-usage"}}}'
+            printf '%s\\n' '{"method":"item/agentMessage","params":{"text":"#{text}"}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      test_pid = self()
+
+      on_message = fn message ->
+        if message.event == :usage_limit_reached do
+          assert %{cause: :usage_limit, detail: ^expected} = RunCause.observed(issue.id)
+        end
+
+        send(test_pid, {:usage_event, message.event})
+      end
+
+      assert {:ok, %{result: :turn_completed}} =
+               RunLog.measure(issue, [], fn ->
+                 AppServer.run(workspace, "Exercise usage-limit advisory", issue, on_message: on_message)
+               end)
+
+      assert_received {:usage_event, :session_started}
+
+      if expected do
+        assert_received {:usage_event, :usage_limit_reached}
+      else
+        refute_received {:usage_event, :usage_limit_reached}
+      end
+
+      assert_received {:usage_event, :notification}
+      assert_received {:usage_event, :turn_completed}
+      refute_received {:usage_event, _}
+
+      entry = log_file |> File.read!() |> String.split("\n", trim: true) |> List.last() |> Jason.decode!()
+      assert entry["outcome"] == "ok"
+      assert entry["detail"] == if(expected, do: "usage_limit: #{expected}", else: nil)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -788,10 +871,16 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
-               AppServer.run(workspace, "Handle generic tool input", issue)
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:approval_auto_answer_unavailable, payload}} =
+               AppServer.run(workspace, "Handle generic tool input", issue, on_message: on_message)
 
       assert payload["method"] == "item/tool/requestUserInput"
+      assert_received {:app_server_message, %{event: :session_started}}
+      assert_received {:app_server_message, %{event: :approval_auto_answer_unavailable}}
+      refute_received {:app_server_message, _}
     after
       File.rm_rf(test_root)
     end
@@ -858,10 +947,16 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
-               AppServer.run(workspace, "Handle option based tool input", issue)
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      assert {:error, {:approval_auto_answer_unavailable, payload}} =
+               AppServer.run(workspace, "Handle option based tool input", issue, on_message: on_message)
 
       assert payload["method"] == "item/tool/requestUserInput"
+      assert_received {:app_server_message, %{event: :session_started}}
+      assert_received {:app_server_message, %{event: :approval_auto_answer_unavailable}}
+      refute_received {:app_server_message, _}
     after
       File.rm_rf(test_root)
     end

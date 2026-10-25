@@ -258,5 +258,4 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp rate_limits_last_seen(_live), do: nil
-
 end

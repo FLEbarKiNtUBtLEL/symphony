@@ -35,6 +35,11 @@ defmodule SymphonyElixir.Application do
   def start_runtime do
     :ok = SymphonyElixir.LogFile.configure()
 
+    # Owned here, by a process that lives as long as the VM. An ETS table dies with
+    # its creator, and letting an agent session create it meant the table vanished
+    # when that agent exited -- before the reconcile that reads it.
+    :ok = SymphonyElixir.RunCause.ensure_table()
+
     children = [
       {Phoenix.PubSub, name: SymphonyElixir.PubSub},
       SymphonyElixir.WorkflowStore,

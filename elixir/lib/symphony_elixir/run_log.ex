@@ -27,6 +27,8 @@ defmodule SymphonyElixir.RunLog do
 
   require Logger
 
+  alias SymphonyElixir.RunCause
+
   alias SymphonyElixir.LogFile
 
   @filename "symphony-runs.jsonl"
@@ -81,18 +83,33 @@ defmodule SymphonyElixir.RunLog do
 
     try do
       result = fun.()
-      record(issue, opts, started_at, started_ms, outcome_of(result))
+      record(issue, opts, started_at, started_ms, with_cause(issue, outcome_of(result)))
       result
     rescue
       exception ->
-        record(issue, opts, started_at, started_ms, {"crash", Exception.message(exception)})
+        record(issue, opts, started_at, started_ms, with_cause(issue, {"crash", Exception.message(exception)}))
         reraise(exception, __STACKTRACE__)
     catch
       kind, value ->
-        record(issue, opts, started_at, started_ms, {"crash", "#{kind}: #{inspect(value)}"})
+        record(issue, opts, started_at, started_ms, with_cause(issue, {"crash", "#{kind}: #{inspect(value)}"}))
         :erlang.raise(kind, value, __STACKTRACE__)
     end
   end
+
+  # A recorded cause belongs in the run's own line, because this file is what
+  # survives the VM and answers "why did this run end" without grepping prose. The
+  # outcome is left alone -- a crash or an error is the more important fact -- and the
+  # cause is added to the detail beside it.
+  defp with_cause(issue, {outcome, detail}) do
+    case issue |> issue_id_for_cause() |> RunCause.summary() do
+      nil -> {outcome, detail}
+      cause when is_nil(detail) -> {outcome, cause}
+      cause -> {outcome, "#{detail}; #{cause}"}
+    end
+  end
+
+  defp issue_id_for_cause(%{id: id}), do: id
+  defp issue_id_for_cause(_issue), do: nil
 
   defp outcome_of(:ok), do: {"ok", nil}
   defp outcome_of({:error, reason}), do: {"error", inspect(reason)}
@@ -209,18 +226,17 @@ defmodule SymphonyElixir.RunLog do
         contents
         |> String.split("\n", trim: true)
         |> Enum.reverse()
-        |> Enum.find_value(fn line ->
-          case decode_line(line) do
-            %{"event" => "rate_limits", "limits" => limits, "observed_at" => at} ->
-              {limits, at}
-
-            _ ->
-              nil
-          end
-        end)
+        |> Enum.find_value(&rate_limits_from_line/1)
 
       _ ->
         nil
+    end
+  end
+
+  defp rate_limits_from_line(line) do
+    case decode_line(line) do
+      %{"event" => "rate_limits", "limits" => limits, "observed_at" => at} -> {limits, at}
+      _ -> nil
     end
   end
 
